@@ -17,10 +17,13 @@ import (
 )
 
 type Request struct {
-	Query    string `json:"query"`
-	ApiKey   string `json:"apikey"`
-	Values   []any  `json:"values"`
-	Database string `json:"db"`
+	Query     string `json:"query"`
+	ApiKey    string `json:"apikey"`
+	KeyStore  string `json:"key"`
+	Values    []any  `json:"values"`
+	Database  string `json:"db"`
+	TTL       int64  `json:"ttl"`
+	MasterKey string `json:"encrypt"`
 }
 
 var (
@@ -71,7 +74,7 @@ func main() {
 	r.Run("0.0.0.0:" + config["dbport"])
 }
 
-func GetOrCreateDB(dbName string) (*badger.DB, error) {
+func GetOrCreateDB(dbName, encrypt string) (*badger.DB, error) {
 	dbMutex.RLock()
 	if db, exists := databases[dbName]; exists {
 		dbMutex.RUnlock()
@@ -88,8 +91,16 @@ func GetOrCreateDB(dbName string) (*badger.DB, error) {
 	}
 
 	// Crear nueva base de datos
+	var key []byte
+	if encrypt != "" {
+		key = []byte(encrypt)
+		if len(key) != 32 {
+			fmt.Println(len(key), "bytes")
+			return nil, fmt.Errorf("invalid master key, must be 32 bytes")
+		}
+	}
 	dbPath := "./databases/" + dbName
-	db, err := OpenBadgerDB(dbPath)
+	db, err := OpenBadgerDB(dbPath, encrypt)
 	if err != nil {
 		return nil, err
 	}
@@ -147,23 +158,16 @@ func ex(ctx *gin.Context) {
 		ctx.JSON(500, gin.H{"status": "error", "message": err.Error(), "result": []any{}})
 		return
 	}
-	if len(mapa.Query) > 1000 {
+	if len(mapa.Query) > 1000 || len(mapa.KeyStore) > 1000 || len(mapa.MasterKey) > 1000 || len(mapa.ApiKey) > 1000 {
 		ctx.JSON(400, gin.H{"status": "error", "message": "query too long", "result": []any{}})
 		return
 	}
 	mapa.Query = strings.TrimSpace(mapa.Query)
-	comando := strings.Split(mapa.Query, " ")
-	fmt.Println(comando)
-	//fmt.Println(mapa.Values...)
-	if len(comando) < 2 {
-		ctx.JSON(400, gin.H{"status": "error", "message": "invalid sintax", "result": []any{}})
-		return
-	}
-	if len(comando) > 2 {
-		comando[1] = strings.Join(comando[1:], " ")
-	}
-	comando1 := strings.ToUpper(comando[0])
-	comando2 := comando[1]
+	mapa.KeyStore = strings.TrimSpace(mapa.KeyStore)
+	mapa.MasterKey = strings.TrimSpace(mapa.MasterKey)
+	mapa.ApiKey = strings.TrimSpace(mapa.ApiKey)
+	comando1 := strings.ToUpper(mapa.Query)
+	comando2 := mapa.KeyStore
 	conf := configurate()
 	if conf["apikey"] != mapa.ApiKey {
 		ctx.JSON(401, gin.H{"status": "error", "message": "invalid apikey", "result": []any{}})
@@ -173,7 +177,7 @@ func ex(ctx *gin.Context) {
 		ctx.JSON(400, gin.H{"status": "error", "message": "database name empty", "result": []any{}})
 		return
 	}
-	db, err := GetOrCreateDB(mapa.Database)
+	db, err := GetOrCreateDB(mapa.Database, mapa.MasterKey)
 	if err != nil {
 		fmt.Println(err)
 		ctx.JSON(500, gin.H{"status": "error", "message": err.Error(), "result": []any{}})
@@ -245,6 +249,17 @@ func ex(ctx *gin.Context) {
 		return
 	}
 	if comando1 == "INSERT" {
+		if mapa.TTL > 0 {
+			ttl := (time.Duration(mapa.TTL) * time.Second)
+			err := InsertDataWithTTL(db, comando2, mapa.Values, ttl)
+			if err != nil {
+				fmt.Println(err)
+				ctx.JSON(500, gin.H{"status": "error", "message": err.Error(), "result": []any{}})
+				return
+			}
+			ctx.JSON(200, gin.H{"status": "success", "message": "ok", "result": []any{}})
+			return
+		}
 		err := InsertData(db, comando2, mapa.Values)
 		if err != nil {
 			fmt.Println(err)
@@ -400,7 +415,7 @@ func UpdateData(db *badger.DB, key string, value []any) error {
 	})
 }
 
-func OpenBadgerDB(path string) (*badger.DB, error) {
+func OpenBadgerDB(path, masterKey string) (*badger.DB, error) {
 	opts := badger.DefaultOptions(path)
 	opts.SyncWrites = true
 	opts.DetectConflicts = false
@@ -409,6 +424,11 @@ func OpenBadgerDB(path string) (*badger.DB, error) {
 	opts.NumMemtables = 2
 	opts.NumLevelZeroTables = 2
 	opts.Logger = nil
+	clave := []byte(masterKey)
+	if len(clave) == 32 {
+		opts.EncryptionKey = clave                          // Clave de 32 bytes
+		opts.EncryptionKeyRotationDuration = 24 * time.Hour // Rotación diaria
+	}
 
 	// Intento 1: Apertura normal
 	db, err := badger.Open(opts)
@@ -419,6 +439,11 @@ func OpenBadgerDB(path string) (*badger.DB, error) {
 
 	// Intento 2: Bypass lock guard
 	opts.BypassLockGuard = true
+	clave = []byte(masterKey)
+	if len(clave) == 32 {
+		opts.EncryptionKey = clave                          // Clave de 32 bytes
+		opts.EncryptionKeyRotationDuration = 24 * time.Hour // Rotación diaria
+	}
 	db, err = badger.Open(opts)
 	if err == nil {
 		fmt.Println("Recovered using BypassLockGuard")
@@ -444,6 +469,11 @@ func OpenBadgerDB(path string) (*badger.DB, error) {
 	opts.SyncWrites = false // Más permisivo
 	opts.BypassLockGuard = true
 	opts.Logger = nil
+	clave = []byte(masterKey)
+	if len(clave) == 32 {
+		opts.EncryptionKey = clave                          // Clave de 32 bytes
+		opts.EncryptionKeyRotationDuration = 24 * time.Hour // Rotación diaria
+	}
 
 	db, err = badger.Open(opts)
 	if err == nil {
@@ -495,6 +525,27 @@ func InsertData(db *badger.DB, key string, value []any) error {
 		}
 
 		return txn.Set([]byte(key), valueBytes)
+	})
+}
+
+func InsertDataWithTTL(db *badger.DB, key string, value []any, ttl time.Duration) error {
+	return db.Update(func(txn *badger.Txn) error {
+		// Verificar si la clave ya existe
+		_, err := txn.Get([]byte(key))
+		if err == nil {
+			return fmt.Errorf("key already exists")
+		}
+		if err != badger.ErrKeyNotFound {
+			return err
+		}
+
+		valueBytes, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+
+		entry := badger.NewEntry([]byte(key), valueBytes).WithTTL(ttl).WithDiscard()
+		return txn.SetEntry(entry)
 	})
 }
 
