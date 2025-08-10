@@ -1,0 +1,5 @@
+{
+    "query": "INSERT, SELECT, LIKE, UPDATE, DELETE, RESTORE, BACKUP + key or path. If LIKE query must specify [100] in values being 100 results",
+    "apikey": "abc123def456",
+    "values": ["any", "data to", {"store":"in db"}]
+}
