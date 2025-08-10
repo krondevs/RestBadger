@@ -2,8 +2,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -177,6 +181,12 @@ func ex(ctx *gin.Context) {
 		ctx.JSON(400, gin.H{"status": "error", "message": "database name empty", "result": []any{}})
 		return
 	}
+	kksr := []byte(mapa.MasterKey)
+	if mapa.MasterKey != "" && len(kksr) != 32 {
+		fmt.Println(len(kksr))
+		ctx.JSON(400, gin.H{"status": "error", "message": "Master key must be 32 bytes", "result": []any{}})
+		return
+	}
 	db, err := GetOrCreateDB(mapa.Database, mapa.MasterKey)
 	if err != nil {
 		fmt.Println(err)
@@ -194,7 +204,7 @@ func ex(ctx *gin.Context) {
 		return
 	}
 	if comando1 == "LIKE" {
-		dat, err := QueryByPrefix(db, comando2, mapa.Values)
+		dat, err := QueryByPrefix(db, comando2, mapa.MasterKey, mapa.Values)
 		if err != nil {
 			fmt.Println(err)
 			ctx.JSON(500, gin.H{"status": "error", "message": err.Error(), "result": []any{}})
@@ -204,7 +214,7 @@ func ex(ctx *gin.Context) {
 		return
 	}
 	if comando1 == "SELECT" {
-		dat, code, err := GetData(db, comando2)
+		dat, code, err := GetData(db, comando2, mapa.MasterKey)
 		if err != nil {
 			fmt.Println(err)
 			ctx.JSON(code, gin.H{"status": "error", "message": err.Error(), "result": []any{}})
@@ -235,7 +245,7 @@ func ex(ctx *gin.Context) {
 		return
 	}
 	if comando1 == "UPDATE" {
-		err := UpdateData(db, comando2, mapa.Values)
+		err := UpdateData(db, comando2, mapa.MasterKey, mapa.Values)
 		if err != nil {
 			fmt.Println(err)
 			code := 500
@@ -251,7 +261,7 @@ func ex(ctx *gin.Context) {
 	if comando1 == "INSERT" {
 		if mapa.TTL > 0 {
 			ttl := (time.Duration(mapa.TTL) * time.Second)
-			err := InsertDataWithTTL(db, comando2, mapa.Values, ttl)
+			err := InsertDataWithTTL(db, comando2, mapa.MasterKey, mapa.Values, ttl)
 			if err != nil {
 				fmt.Println(err)
 				ctx.JSON(500, gin.H{"status": "error", "message": err.Error(), "result": []any{}})
@@ -260,7 +270,7 @@ func ex(ctx *gin.Context) {
 			ctx.JSON(200, gin.H{"status": "success", "message": "ok", "result": []any{}})
 			return
 		}
-		err := InsertData(db, comando2, mapa.Values)
+		err := InsertData(db, comando2, mapa.MasterKey, mapa.Values)
 		if err != nil {
 			fmt.Println(err)
 			ctx.JSON(500, gin.H{"status": "error", "message": err.Error(), "result": []any{}})
@@ -327,8 +337,15 @@ func BackupSpecificDB(dbName, backupPath string) error {
 	return CreateBackup(db, backupPath)
 }
 
-func GetData(db *badger.DB, key string) ([]any, int, error) {
+func GetData(db *badger.DB, key, encrypt string) ([]any, int, error) {
 	var value []byte
+	var masterKey []byte
+	if encrypt != "" {
+		masterKey = []byte(encrypt)
+	}
+	if len(masterKey) != 32 {
+		return nil, 400, fmt.Errorf("key must be 32 bytes")
+	}
 	result := make([]any, 0)
 	code := 0
 	err := db.View(func(txn *badger.Txn) error {
@@ -346,6 +363,12 @@ func GetData(db *badger.DB, key string) ([]any, int, error) {
 	if err != nil {
 		return nil, code, err
 	}
+	if len(masterKey) == 32 {
+		value, err = Decrypt(value, masterKey)
+		if err != nil {
+			return nil, 500, err
+		}
+	}
 	err = json.Unmarshal(value, &result)
 	if err != nil {
 		return nil, 500, err
@@ -354,8 +377,69 @@ func GetData(db *badger.DB, key string) ([]any, int, error) {
 	return result, 200, err
 }
 
-func QueryByPrefix(db *badger.DB, prefix string, numero []any) (map[string][]any, error) {
+func Encrypt(plaintext []byte, key []byte) ([]byte, error) {
+	// Crear cipher block
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Usar GCM (Galois/Counter Mode)
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generar nonce aleatorio
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+
+	// Cifrar (nonce + ciphertext + tag)
+	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+	return ciphertext, nil
+}
+
+func Decrypt(ciphertext []byte, key []byte) ([]byte, error) {
+	// Crear cipher block
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Usar GCM
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	// Extraer nonce
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+
+	// Descifrar y verificar
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
+}
+
+func QueryByPrefix(db *badger.DB, prefix, encrypt string, numero []any) (map[string][]any, error) {
 	result := make(map[string][]any)
+	var masterKey []byte
+	if encrypt != "" {
+		masterKey = []byte(encrypt)
+	}
+	if len(masterKey) != 32 {
+		return result, fmt.Errorf("key must be 32 bytes")
+	}
 	nu := numero[0].(float64)
 	err := db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -375,6 +459,12 @@ func QueryByPrefix(db *badger.DB, prefix string, numero []any) (map[string][]any
 			hhsb := make([]any, 0)
 			if err != nil {
 				continue
+			}
+			if len(masterKey) == 32 {
+				val, err = Decrypt(val, masterKey)
+				if err != nil {
+					continue
+				}
 			}
 			err = json.Unmarshal(val, &hhsb)
 			if err != nil {
@@ -396,7 +486,7 @@ func DeleteData(db *badger.DB, key string) error {
 	})
 }
 
-func UpdateData(db *badger.DB, key string, value []any) error {
+func UpdateData(db *badger.DB, key, encrypt string, value []any) error {
 	return db.Update(func(txn *badger.Txn) error {
 		_, err := txn.Get([]byte(key))
 		if err == badger.ErrKeyNotFound {
@@ -405,12 +495,17 @@ func UpdateData(db *badger.DB, key string, value []any) error {
 		if err != nil {
 			return err
 		}
-
 		valueBytes, err := json.Marshal(value)
 		if err != nil {
 			return err
 		}
-
+		masterkey := []byte(encrypt)
+		if len(masterkey) == 32 {
+			valueBytes, err = Encrypt(valueBytes, masterkey)
+			if err != nil {
+				return err
+			}
+		}
 		return txn.Set([]byte(key), valueBytes)
 	})
 }
@@ -424,11 +519,6 @@ func OpenBadgerDB(path, masterKey string) (*badger.DB, error) {
 	opts.NumMemtables = 2
 	opts.NumLevelZeroTables = 2
 	opts.Logger = nil
-	clave := []byte(masterKey)
-	if len(clave) == 32 {
-		opts.EncryptionKey = clave                          // Clave de 32 bytes
-		opts.EncryptionKeyRotationDuration = 24 * time.Hour // Rotación diaria
-	}
 
 	// Intento 1: Apertura normal
 	db, err := badger.Open(opts)
@@ -439,11 +529,7 @@ func OpenBadgerDB(path, masterKey string) (*badger.DB, error) {
 
 	// Intento 2: Bypass lock guard
 	opts.BypassLockGuard = true
-	clave = []byte(masterKey)
-	if len(clave) == 32 {
-		opts.EncryptionKey = clave                          // Clave de 32 bytes
-		opts.EncryptionKeyRotationDuration = 24 * time.Hour // Rotación diaria
-	}
+
 	db, err = badger.Open(opts)
 	if err == nil {
 		fmt.Println("Recovered using BypassLockGuard")
@@ -469,11 +555,6 @@ func OpenBadgerDB(path, masterKey string) (*badger.DB, error) {
 	opts.SyncWrites = false // Más permisivo
 	opts.BypassLockGuard = true
 	opts.Logger = nil
-	clave = []byte(masterKey)
-	if len(clave) == 32 {
-		opts.EncryptionKey = clave                          // Clave de 32 bytes
-		opts.EncryptionKeyRotationDuration = 24 * time.Hour // Rotación diaria
-	}
 
 	db, err = badger.Open(opts)
 	if err == nil {
@@ -508,7 +589,7 @@ func CreateBackup(db *badger.DB, backupPath string) error {
 	return err
 }
 
-func InsertData(db *badger.DB, key string, value []any) error {
+func InsertData(db *badger.DB, key, encrypt string, value []any) error {
 	return db.Update(func(txn *badger.Txn) error {
 		_, err := txn.Get([]byte(key))
 		if err == nil {
@@ -523,12 +604,18 @@ func InsertData(db *badger.DB, key string, value []any) error {
 		if err != nil {
 			return err
 		}
-
+		masterkey := []byte(encrypt)
+		if len(masterkey) == 32 {
+			valueBytes, err = Encrypt(valueBytes, masterkey)
+			if err != nil {
+				return err
+			}
+		}
 		return txn.Set([]byte(key), valueBytes)
 	})
 }
 
-func InsertDataWithTTL(db *badger.DB, key string, value []any, ttl time.Duration) error {
+func InsertDataWithTTL(db *badger.DB, key, encrypt string, value []any, ttl time.Duration) error {
 	return db.Update(func(txn *badger.Txn) error {
 		// Verificar si la clave ya existe
 		_, err := txn.Get([]byte(key))
@@ -543,7 +630,13 @@ func InsertDataWithTTL(db *badger.DB, key string, value []any, ttl time.Duration
 		if err != nil {
 			return err
 		}
-
+		masterkey := []byte(encrypt)
+		if len(masterkey) == 32 {
+			valueBytes, err = Encrypt(valueBytes, masterkey)
+			if err != nil {
+				return err
+			}
+		}
 		entry := badger.NewEntry([]byte(key), valueBytes).WithTTL(ttl).WithDiscard()
 		return txn.SetEntry(entry)
 	})
