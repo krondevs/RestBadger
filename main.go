@@ -8,28 +8,33 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
 
 type Request struct {
-	Query  string `json:"query"`
-	ApiKey string `json:"apikey"`
-	Values []any  `json:"values"`
+	Query    string `json:"query"`
+	ApiKey   string `json:"apikey"`
+	Values   []any  `json:"values"`
+	Database string `json:"db"`
 }
+
+var (
+	databases = make(map[string]*badger.DB)
+	dbMutex   = sync.RWMutex{}
+)
 
 func main() {
 	conf, err := os.ReadFile("dbconfig.json")
 	var config map[string]string
 	if err != nil {
 		config = map[string]string{
-			"apikey":    "gorms",
-			"dbport":    "3308",
-			"directory": "./database",
+			"apikey": "gorms",
+			"dbport": "3308",
 		}
 		jsonData, _ := json.MarshalIndent(config, "", " ")
 		os.WriteFile("dbconfig.json", jsonData, 0777)
@@ -41,22 +46,24 @@ func main() {
 	if err == nil {
 		return
 	}
-	db, err := OpenBadgerDB(config["directory"])
+	/*db, err := OpenBadgerDB(config["directory"])
 	if err != nil {
 		panic(err)
 	}
 	kkdhooo := uuid.New().String()
-	InsertData(db, kkdhooo, []any{kkdhooo})
+	InsertData(db, kkdhooo, []any{kkdhooo})*/
 	/*go func() {
 		ticker := time.NewTicker(60 * time.Minute)
 		for range ticker.C {
 			db.RunValueLogGC(0.7)
 		}
 	}()*/
+	os.MkdirAll("backups", 0755)
+	os.MkdirAll("databases", 0755)
 	r := GinRouter()
 	fmt.Println("server ir running...", config["dbport"])
 	r.POST("/data", func(ctx *gin.Context) {
-		ex(ctx, db)
+		ex(ctx)
 	})
 	r.POST("/", func(ctx *gin.Context) {
 		ctx.String(200, "ok")
@@ -64,14 +71,64 @@ func main() {
 	r.Run("0.0.0.0:" + config["dbport"])
 }
 
+func GetOrCreateDB(dbName string) (*badger.DB, error) {
+	dbMutex.RLock()
+	if db, exists := databases[dbName]; exists {
+		dbMutex.RUnlock()
+		return db, nil
+	}
+	dbMutex.RUnlock()
+
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
+	// Double-check después del lock
+	if db, exists := databases[dbName]; exists {
+		return db, nil
+	}
+
+	// Crear nueva base de datos
+	dbPath := "./databases/" + dbName
+	db, err := OpenBadgerDB(dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	databases[dbName] = db
+	return db, nil
+}
+
+// Cerrar una base de datos específica
+func CloseDB(dbName string) error {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
+	if db, exists := databases[dbName]; exists {
+		err := db.Close()
+		delete(databases, dbName)
+		return err
+	}
+	return nil
+}
+
+// Cerrar todas las bases de datos
+func CloseAllDBs() {
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
+	for name, db := range databases {
+		db.Close()
+		delete(databases, name)
+	}
+}
+
 func configurate() map[string]string {
 	conf, err := os.ReadFile("dbconfig.json")
 	var config map[string]string
 	if err != nil {
 		config = map[string]string{
-			"apikey":    "gorms",
-			"dbport":    "3308",
-			"directory": "./database",
+			"apikey": "gorms",
+			"dbport": "3308",
 		}
 		jsonData, _ := json.MarshalIndent(config, "", " ")
 		os.WriteFile("dbconfig.json", jsonData, 0777)
@@ -82,7 +139,7 @@ func configurate() map[string]string {
 	}
 }
 
-func ex(ctx *gin.Context, db *badger.DB) {
+func ex(ctx *gin.Context) {
 	var mapa Request
 	err := ctx.ShouldBindJSON(&mapa)
 	if err != nil {
@@ -112,8 +169,18 @@ func ex(ctx *gin.Context, db *badger.DB) {
 		ctx.JSON(401, gin.H{"status": "error", "message": "invalid apikey", "result": []any{}})
 		return
 	}
+	if mapa.Database == "" {
+		ctx.JSON(400, gin.H{"status": "error", "message": "database name empty", "result": []any{}})
+		return
+	}
+	db, err := GetOrCreateDB(mapa.Database)
+	if err != nil {
+		fmt.Println(err)
+		ctx.JSON(500, gin.H{"status": "error", "message": err.Error(), "result": []any{}})
+		return
+	}
 	if comando1 == "BACKUP" {
-		err = CreateBackup(db, "./"+comando2)
+		err = CreateBackup(db, "./backups/"+mapa.Database+"_"+GetFormattedDate()+".bak")
 		if err != nil {
 			fmt.Println(err)
 			ctx.JSON(500, gin.H{"status": "error", "message": err.Error(), "result": []any{}})
@@ -200,6 +267,10 @@ func ex(ctx *gin.Context, db *badger.DB) {
 	ctx.JSON(400, gin.H{"status": "error", "message": "invalid sintax", "result": []any{}})
 }
 
+func GetFormattedDate() string {
+	return time.Now().Format("2006-01-02_15_04_05")
+}
+
 func RestoreBackup(db *badger.DB, backupPath string) error {
 	file, err := os.Open(backupPath)
 	if err != nil {
@@ -208,6 +279,37 @@ func RestoreBackup(db *badger.DB, backupPath string) error {
 	defer file.Close()
 
 	return db.Load(file, 16)
+}
+
+// Obtener estadísticas de una base de datos
+func GetDBStats(dbName string) (map[string]interface{}, error) {
+	dbMutex.RLock()
+	db, exists := databases[dbName]
+	dbMutex.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("database not found")
+	}
+
+	lsm, vlog := db.Size()
+	return map[string]interface{}{
+		"lsm_size":  lsm,
+		"vlog_size": vlog,
+		"name":      dbName,
+	}, nil
+}
+
+// Backup de una base de datos específica
+func BackupSpecificDB(dbName, backupPath string) error {
+	dbMutex.RLock()
+	db, exists := databases[dbName]
+	dbMutex.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("database not found")
+	}
+
+	return CreateBackup(db, backupPath)
 }
 
 func GetData(db *badger.DB, key string) ([]any, int, error) {
