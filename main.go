@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dgraph-io/badger/v4"
+	"github.com/dgraph-io/badger/v3"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 )
@@ -512,13 +512,14 @@ func UpdateData(db *badger.DB, key, encrypt string, value []any) error {
 
 func OpenBadgerDB(path, masterKey string) (*badger.DB, error) {
 	opts := badger.DefaultOptions(path)
-	opts.SyncWrites = true
-	opts.DetectConflicts = false
-	opts.CompactL0OnClose = false
-	opts.MemTableSize = 16 << 20
-	opts.NumMemtables = 2
-	opts.NumLevelZeroTables = 2
-	opts.Logger = nil
+	opts.SyncWrites = true            // ✓ Correcto para durabilidad
+	opts.DetectConflicts = false      // ✓ OK
+	opts.CompactL0OnClose = true      // Cambiar a true
+	opts.ValueLogFileSize = 64 << 20  // ✓ OK
+	opts.MemTableSize = 64 << 20      // ✓ OK
+	opts.NumMemtables = 2             // Agregar: más memtables
+	opts.NumLevelZeroTables = 2       // Agregar: más tablas L0
+	opts.ValueLogMaxEntries = 1000000 // Agregar: límite entradas
 
 	// Intento 1: Apertura normal
 	db, err := badger.Open(opts)
@@ -548,13 +549,15 @@ func OpenBadgerDB(path, masterKey string) (*badger.DB, error) {
 
 	// Intento 4: Configuración mínima
 	opts = badger.DefaultOptions(path)
-	opts.MemTableSize = 1 << 20     // 1MB
-	opts.ValueLogFileSize = 1 << 20 // 1MB - COMPATIBLE v4
-	opts.NumMemtables = 1
+	opts.MemTableSize = 1 << 20      // 1MB
+	opts.ValueLogFileSize = 64 << 20 // 64MB en lugar del default
+	opts.MemTableSize = 64 << 20     // 64MB
 	opts.NumLevelZeroTables = 1
 	opts.SyncWrites = false // Más permisivo
 	opts.BypassLockGuard = true
 	opts.Logger = nil
+	opts.BaseTableSize = 64 << 20
+	opts.ValueThreshold = 100 << 10
 
 	db, err = badger.Open(opts)
 	if err == nil {

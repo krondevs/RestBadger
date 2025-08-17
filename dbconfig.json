@@ -1,5 +1,4 @@
 {
  "apikey": "gorms",
- "dbport": "3308",
- "directory": "./database"
+ "dbport": "3308"
 }
